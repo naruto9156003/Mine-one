@@ -1,59 +1,108 @@
-name: Android Emulator (Remote Access)
+name: Android Emulator + Tailscale + RustDesk + noVNC + Ngrok (A)
+
 on:
   workflow_dispatch:
+    inputs:
+      quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
+      runtime_minutes:    { description: "Runtime in minutes (max 360)", required: false, default: "355" }
+      api_level:          { description: "Android API Level", required: false, default: "34" }
+      device:             { description: "Device profile (pixel_7 etc)", required: false, default: "pixel_7" }
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  android-vm:
-    runs-on: macos-latest
-    timeout-minutes: 350
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install system image + create AVD
+      - name: Enable KVM
         run: |
-          sdkmanager "platform-tools" "emulator"
-          sdkmanager "system-images;android-33;google_apis;arm64-v8a"
-          echo "no" | avdmanager create avd -n phone -k "system-images;android-33;google_apis;arm64-v8a" --device "pixel_6"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
-      - name: Boot emulator
+      - name: Install dependencies
         run: |
-          $ANDROID_HOME/emulator/emulator -avd phone -no-audio -no-window -gpu swiftshader_indirect &
-          adb wait-for-device
-          adb shell input keyevent 82
+          sudo apt-get update
+          sudo apt-get install -y curl jq unzip xvfb fluxbox x11vnc novnc websockify net-tools
 
-      - name: Wait for full boot
+      # ==================== NGROK SETUP ====================
+      - name: Setup Ngrok
         run: |
-          echo "Waiting for emulator to fully boot..."
-          adb shell 'while [[ -z $(getprop sys.boot_completed | tr -d "\r") ]]; do sleep 2; done'
-          echo "Boot completed."
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update && sudo apt-get install ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+          echo "Ngrok Auth Token added successfully"
 
-      - name: Spoof device model as Poco C3
+      - name: Start Ngrok Tunnels (background)
         run: |
-          adb root
-          adb shell setprop ro.product.model "POCO C3"
-          adb shell setprop ro.product.manufacturer "POCO"
-          adb shell setprop ro.product.brand "POCO"
-
-      - name: Install ngrok tunnel (ADB port expose)
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-        run: |
-          brew install ngrok
-          ngrok config add-authtoken $NGROK_AUTHTOKEN
-          ngrok tcp 5555 --log=stdout &
+          # noVNC (Web browser access)
+          ngrok http 6080 --log=stdout > ngrok_novnc.log 2>&1 &
+          # Optional: RustDesk port (if needed)
+          # ngrok tcp 21118 --log=stdout > ngrok_rustdesk.log 2>&1 &
           sleep 5
-          curl -s http://localhost:4040/api/tunnels
+          NGROK_NOVNC_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
+          echo "NGROK_NOVNC_URL=$NGROK_NOVNC_URL" >> $GITHUB_ENV
+          echo "✅ Ngrok noVNC URL: $NGROK_NOVNC_URL"
 
-      - name: Keep session alive
+      # ==================== TAILSCALE (Optional - rakh sakte ho) ====================
+      - name: Setup Tailscale (Optional)
         run: |
-          echo "Emulator running. Check ngrok tunnel URL above to connect via adb connect <host>:<port>"
-          sleep 20000
+          curl -fsSL https://tailscale.com/install.sh | sh
+          # Agar Tailscale bhi use karna hai toh secrets add karke uncomment kar do
+          # sudo tailscale up --authkey "${{ secrets.TS_AUTHKEY }}" --hostname "android-bullet"
+
+      # ==================== ANDROID EMULATOR ====================
+      - name: Setup Android Emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.api_level }}
+          target: google_apis
+          arch: x86_64
+          profile: ${{ inputs.device }}
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          script: echo "Emulator booting..."
+
+      - name: Launch VNC + noVNC
+        run: |
+          adb wait-for-device
+          sudo Xvfb :99 -screen 0 1080x1920x24 &
+          export DISPLAY=:99
+          fluxbox &
+          x11vnc -display :99 -forever -shared -rfbport 5900 -bg
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+          sleep 8
+
+      - name: Install & Launch RustDesk
+        run: |
+          wget https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.deb -O rustdesk.deb
+          sudo apt install -y ./rustdesk.deb
+          rustdesk --service &
+          echo "RustDesk running..."
+
+      - name: Take Screenshot
+        run: |
+          adb exec-out screencap -p > screenshot.png
+          curl -F "file=@screenshot.png" https://store1.gofile.io/uploadFile > gofile.json
+          SCREENSHOT=$(jq -r '.data.downloadPage' gofile.json)
+          echo "SCREENSHOT_URL=$SCREENSHOT" >> $GITHUB_ENV
+
+      - name: Keep Alive + Status
+        run: |
+          RUNTIME=${{ inputs.runtime_minutes }}
+          [[ "${{ inputs.quick_test }}" == "true" ]] && RUNTIME=5
+          [ $RUNTIME -gt 360 ] && RUNTIME=355
+          end=$((SECONDS + RUNTIME*60))
+          while [ $SECONDS -lt $end ]; do
+            echo "🔴 Android Emulator Running"
+            echo "🌐 Ngrok noVNC: $NGROK_NOVNC_URL"
+            echo "📸 Screenshot: $SCREENSHOT_URL"
+            sleep 60
+          done
