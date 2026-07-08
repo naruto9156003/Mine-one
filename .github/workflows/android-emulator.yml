@@ -6,7 +6,7 @@ on:
       quick_test:      { description: "5 min test", type: boolean, default: false }
       runtime_minutes: { description: "Runtime minutes", required: false, default: "355" }
       api_level:       { description: "Android API Level", required: false, default: "34" }
-      device:          { description: "Device (pixel_7 etc)", required: false, default: "pixel_7" }
+      device:          { description: "Device profile", required: false, default: "pixel_7" }
 
 permissions:
   contents: read
@@ -30,7 +30,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq unzip xvfb fluxbox x11vnc novnc websockify net-tools
+          sudo apt-get install -y curl jq unzip xvfb fluxbox x11vnc novnc websockify
 
       - name: Setup Ngrok
         run: |
@@ -39,62 +39,48 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ngrok
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
 
-      - name: Setup Android Emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ inputs.api_level }}
-          target: google_apis
-          arch: x86_64
-          profile: ${{ inputs.device }}
-          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
-          script: echo "Emulator booting..."
-
-      - name: Start VNC + noVNC + Ngrok
+      - name: Setup & Start Emulator + VNC + Ngrok
         run: |
-          adb wait-for-device --timeout=60
+          # Emulator already started by previous action, just wait
+          adb wait-for-device --timeout=120
+          echo "Emulator is ready"
 
-          # Start virtual display
+          # Virtual Display + VNC
           sudo Xvfb :99 -screen 0 1080x1920x24 &
           export DISPLAY=:99
           fluxbox &
+          sleep 3
 
-          # Start x11vnc
-          x11vnc -display :99 -forever -shared -rfbport 5900 -bg
+          x11vnc -display :99 -forever -shared -rfbport 5900 -bg &
+          sleep 5
 
-          # Start noVNC
-          websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /dev/null 2>&1 &
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
           sleep 8
 
-          # Start Ngrok
+          # Ngrok
           ngrok http 6080 --log=stdout > ngrok.log 2>&1 &
           sleep 10
 
-          # Get Ngrok URL
-          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url // "Waiting..."')
+          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' || echo "Not ready")
           echo "NGROK_URL=$NGROK_URL" >> $GITHUB_ENV
-          echo "🌐 Ngrok URL: $NGROK_URL"
+          echo "🌐 **Ngrok URL:** $NGROK_URL"
 
-      - name: Install RustDesk
+      - name: RustDesk & Screenshot
         run: |
           wget -q https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.deb -O rustdesk.deb
           sudo apt install -y ./rustdesk.deb
           rustdesk --service &
-          echo "RustDesk started"
-
-      - name: Screenshot
-        run: |
           adb exec-out screencap -p > screen.png
-          curl -F "file=@screen.png" https://store1.gofile.io/uploadFile | jq -r '.data.downloadPage' > screenshot_url.txt
-          echo "SCREENSHOT_URL=$(cat screenshot_url.txt)" >> $GITHUB_ENV
+          curl -F "file=@screen.png" https://store1.gofile.io/uploadFile | jq -r '.data.downloadPage' > url.txt
+          echo "SCREENSHOT_URL=$(cat url.txt)" >> $GITHUB_ENV
 
       - name: Keep Alive
         run: |
           RUNTIME=${{ inputs.runtime_minutes }}
           [[ "${{ inputs.quick_test }}" == "true" ]] && RUNTIME=5
           [ $RUNTIME -gt 360 ] && RUNTIME=355
-
           end=$((SECONDS + RUNTIME*60))
           while [ $SECONDS -lt $end ]; do
-            echo "✅ Running | Ngrok: $NGROK_URL | Screenshot: $SCREENSHOT_URL"
+            echo "✅ Android Running | Ngrok: $NGROK_URL"
             sleep 60
           done
