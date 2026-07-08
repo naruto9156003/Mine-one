@@ -1,12 +1,12 @@
-name: Android Emulator + Tailscale + RustDesk + noVNC + Ngrok (A)
+name: Android Emulator + Ngrok + RustDesk + noVNC (A)
 
 on:
   workflow_dispatch:
     inputs:
-      quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
-      runtime_minutes:    { description: "Runtime in minutes (max 360)", required: false, default: "355" }
-      api_level:          { description: "Android API Level", required: false, default: "34" }
-      device:             { description: "Device profile (pixel_7 etc)", required: false, default: "pixel_7" }
+      quick_test:      { description: "5 min test", type: boolean, default: false }
+      runtime_minutes: { description: "Runtime minutes", required: false, default: "355" }
+      api_level:       { description: "Android API Level", required: false, default: "34" }
+      device:          { description: "Device (pixel_7 etc)", required: false, default: "pixel_7" }
 
 permissions:
   contents: read
@@ -27,39 +27,18 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y curl jq unzip xvfb fluxbox x11vnc novnc websockify net-tools
 
-      # ==================== NGROK SETUP ====================
       - name: Setup Ngrok
         run: |
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update && sudo apt-get install ngrok
+          sudo apt-get update && sudo apt-get install -y ngrok
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
-          echo "Ngrok Auth Token added successfully"
 
-      - name: Start Ngrok Tunnels (background)
-        run: |
-          # noVNC (Web browser access)
-          ngrok http 6080 --log=stdout > ngrok_novnc.log 2>&1 &
-          # Optional: RustDesk port (if needed)
-          # ngrok tcp 21118 --log=stdout > ngrok_rustdesk.log 2>&1 &
-          sleep 5
-          NGROK_NOVNC_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
-          echo "NGROK_NOVNC_URL=$NGROK_NOVNC_URL" >> $GITHUB_ENV
-          echo "✅ Ngrok noVNC URL: $NGROK_NOVNC_URL"
-
-      # ==================== TAILSCALE (Optional - rakh sakte ho) ====================
-      - name: Setup Tailscale (Optional)
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          # Agar Tailscale bhi use karna hai toh secrets add karke uncomment kar do
-          # sudo tailscale up --authkey "${{ secrets.TS_AUTHKEY }}" --hostname "android-bullet"
-
-      # ==================== ANDROID EMULATOR ====================
       - name: Setup Android Emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -70,39 +49,52 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
           script: echo "Emulator booting..."
 
-      - name: Launch VNC + noVNC
+      - name: Start VNC + noVNC + Ngrok
         run: |
-          adb wait-for-device
+          adb wait-for-device --timeout=60
+
+          # Start virtual display
           sudo Xvfb :99 -screen 0 1080x1920x24 &
           export DISPLAY=:99
           fluxbox &
+
+          # Start x11vnc
           x11vnc -display :99 -forever -shared -rfbport 5900 -bg
-          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+
+          # Start noVNC
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /dev/null 2>&1 &
           sleep 8
 
-      - name: Install & Launch RustDesk
+          # Start Ngrok
+          ngrok http 6080 --log=stdout > ngrok.log 2>&1 &
+          sleep 10
+
+          # Get Ngrok URL
+          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url // "Waiting..."')
+          echo "NGROK_URL=$NGROK_URL" >> $GITHUB_ENV
+          echo "🌐 Ngrok URL: $NGROK_URL"
+
+      - name: Install RustDesk
         run: |
-          wget https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.deb -O rustdesk.deb
+          wget -q https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.deb -O rustdesk.deb
           sudo apt install -y ./rustdesk.deb
           rustdesk --service &
-          echo "RustDesk running..."
+          echo "RustDesk started"
 
-      - name: Take Screenshot
+      - name: Screenshot
         run: |
-          adb exec-out screencap -p > screenshot.png
-          curl -F "file=@screenshot.png" https://store1.gofile.io/uploadFile > gofile.json
-          SCREENSHOT=$(jq -r '.data.downloadPage' gofile.json)
-          echo "SCREENSHOT_URL=$SCREENSHOT" >> $GITHUB_ENV
+          adb exec-out screencap -p > screen.png
+          curl -F "file=@screen.png" https://store1.gofile.io/uploadFile | jq -r '.data.downloadPage' > screenshot_url.txt
+          echo "SCREENSHOT_URL=$(cat screenshot_url.txt)" >> $GITHUB_ENV
 
-      - name: Keep Alive + Status
+      - name: Keep Alive
         run: |
           RUNTIME=${{ inputs.runtime_minutes }}
           [[ "${{ inputs.quick_test }}" == "true" ]] && RUNTIME=5
           [ $RUNTIME -gt 360 ] && RUNTIME=355
+
           end=$((SECONDS + RUNTIME*60))
           while [ $SECONDS -lt $end ]; do
-            echo "🔴 Android Emulator Running"
-            echo "🌐 Ngrok noVNC: $NGROK_NOVNC_URL"
-            echo "📸 Screenshot: $SCREENSHOT_URL"
+            echo "✅ Running | Ngrok: $NGROK_URL | Screenshot: $SCREENSHOT_URL"
             sleep 60
           done
