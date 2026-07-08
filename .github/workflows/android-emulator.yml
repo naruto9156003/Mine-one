@@ -1,45 +1,72 @@
-name: Android + Tailscale + scrcpy (Recommended)
+name: Android Emulator + Tailscale (Simple & Reliable)
 
 on:
   workflow_dispatch:
     inputs:
       runtime_minutes:
-        description: "Runtime minutes"
+        description: "Runtime in minutes"
         required: false
-        default: "240"
+        default: "180"
 
 jobs:
   android:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 240
     steps:
-      - name: Setup Tailscale
+      - name: Install Dependencies + Tailscale + Socat
         run: |
+          sudo apt-get update
+          # socat add kiya hai port-forwarding ke liye
+          sudo apt-get install -y curl adb scrcpy socat
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey ${{ secrets.TS_AUTHKEY }} --hostname "android-emu" --accept-routes=true
+
+          sudo tailscale up --authkey ${{ secrets.TS_AUTHKEY }} --hostname "android-emu" --accept-routes=true --accept-dns=true
           echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+          echo "✅ Tailscale connected"
 
-      - name: Install Android SDK + Emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 34
-          target: google_apis
-          arch: x86_64
-          profile: pixel_7
-          emulator-options: -no-window -no-audio -gpu swiftshader_indirect
-          script: echo "Emulator ready"
-
-      - name: Setup scrcpy + Keep Alive
+      - name: Create AVD and Start Emulator
         run: |
-          sudo apt-get update && sudo apt-get install -y scrcpy adb
-          export ANDROID_HOME=/usr/local/lib/android/sdk
-          export PATH=$ANDROID_HOME/platform-tools:$PATH
+          export ANDROID_HOME=$ANDROID_SDK_ROOT
+          export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+
+          echo "Downloading System Image..."
+          # Android 29 (Android 10) x86_64 image download kar rahe hain
+          yes | sdkmanager "system-images;android-29;default;x86_64" > /dev/null
+          
+          echo "Creating AVD..."
+          echo "no" | avdmanager create avd -n test -k "system-images;android-29;default;x86_64" --force
+
+          echo "Starting Emulator in Background..."
+          # -no-boot-anim add kiya hai taki boot thoda fast ho
+          emulator -avd test -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect &
+          echo "EMU_PID=$!" >> $GITHUB_ENV
 
           adb wait-for-device
-          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null)" != "1" ]; do sleep 10; done
+          echo "Waiting for Android to boot (this might take 5-15 minutes on Ubuntu)..."
+          
+          # Carriage return (\r) ka trap fix kiya
+          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
+            sleep 15
+          done
+          echo "✅ Android Emulator Booted"
 
-          echo "✅ Emulator booted. Use scrcpy from your device over Tailscale"
+      - name: Expose ADB Port & Keep Alive
+        run: |
+          # Dhyan de: Localhost (127.0.0.1) ke 5555 port ko Tailscale IP par expose kar rahe hain
+          socat TCP-LISTEN:5555,fork,bind=$TAILSCALE_IP TCP:127.0.0.1:5555 &
+
+          echo "=========================================="
+          echo "🎉 READY TO CONNECT!"
           echo "Tailscale IP: $TAILSCALE_IP"
+          echo ""
+          echo "Apne PC par yeh commands run karo:"
+          echo "1. adb connect $TAILSCALE_IP:5555"
+          echo "2. scrcpy -s $TAILSCALE_IP:5555"
+          echo "=========================================="
 
-          # Keep workflow alive
-          sleep ${{ inputs.runtime_minutes }}m
+          RUNTIME=${{ inputs.runtime_minutes }}
+          end=$((SECONDS + RUNTIME*60))
+          while [ $SECONDS -lt $end ]; do
+            echo "✅ Emulator Running | Tailscale IP: $TAILSCALE_IP | Time Left: $(((end - SECONDS)/60)) mins"
+            sleep 60
+          done
