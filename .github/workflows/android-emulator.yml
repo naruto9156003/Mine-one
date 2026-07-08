@@ -21,14 +21,20 @@ jobs:
       - name: Install system image + create AVD
         run: |
           sdkmanager "platform-tools" "emulator"
-          sdkmanager "system-images;android-33;google_apis;x86_64"
-          echo "no" | avdmanager create avd -n phone -k "system-images;android-33;google_apis;x86_64" --device "pixel_6"
+          sdkmanager "system-images;android-33;google_apis;arm64-v8a"
+          echo "no" | avdmanager create avd -n phone -k "system-images;android-33;google_apis;arm64-v8a" --device "pixel_6"
 
       - name: Boot emulator
         run: |
-          $ANDROID_HOME/emulator/emulator -avd phone -no-audio -gpu swiftshader_indirect &
+          $ANDROID_HOME/emulator/emulator -avd phone -no-audio -no-window -gpu swiftshader_indirect &
           adb wait-for-device
           adb shell input keyevent 82
+
+      - name: Wait for full boot
+        run: |
+          echo "Waiting for emulator to fully boot..."
+          adb shell 'while [[ -z $(getprop sys.boot_completed | tr -d "\r") ]]; do sleep 2; done'
+          echo "Boot completed."
 
       - name: Spoof device model as Poco C3
         run: |
@@ -37,12 +43,7 @@ jobs:
           adb shell setprop ro.product.manufacturer "POCO"
           adb shell setprop ro.product.brand "POCO"
 
-      - name: Install scrcpy + start VNC-like stream
-        run: |
-          brew install scrcpy socat
-          brew install --cask android-platform-tools || true
-
-      - name: Install & start ngrok tunnel (ADB + VNC port expose)
+      - name: Install ngrok tunnel (ADB port expose)
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
@@ -54,5 +55,5 @@ jobs:
 
       - name: Keep session alive
         run: |
-          echo "Emulator running, connect via ngrok tunnel URL shown above."
+          echo "Emulator running. Check ngrok tunnel URL above to connect via adb connect <host>:<port>"
           sleep 20000
