@@ -1,0 +1,58 @@
+name: Android Emulator (Remote Access)
+on:
+  workflow_dispatch:
+
+jobs:
+  android-vm:
+    runs-on: macos-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install system image + create AVD
+        run: |
+          sdkmanager "platform-tools" "emulator"
+          sdkmanager "system-images;android-33;google_apis;x86_64"
+          echo "no" | avdmanager create avd -n phone -k "system-images;android-33;google_apis;x86_64" --device "pixel_6"
+
+      - name: Boot emulator
+        run: |
+          $ANDROID_HOME/emulator/emulator -avd phone -no-audio -gpu swiftshader_indirect &
+          adb wait-for-device
+          adb shell input keyevent 82
+
+      - name: Spoof device model as Poco C3
+        run: |
+          adb root
+          adb shell setprop ro.product.model "POCO C3"
+          adb shell setprop ro.product.manufacturer "POCO"
+          adb shell setprop ro.product.brand "POCO"
+
+      - name: Install scrcpy + start VNC-like stream
+        run: |
+          brew install scrcpy socat
+          brew install --cask android-platform-tools || true
+
+      - name: Install & start ngrok tunnel (ADB + VNC port expose)
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          brew install ngrok
+          ngrok config add-authtoken $NGROK_AUTHTOKEN
+          ngrok tcp 5555 --log=stdout &
+          sleep 5
+          curl -s http://localhost:4040/api/tunnels
+
+      - name: Keep session alive
+        run: |
+          echo "Emulator running, connect via ngrok tunnel URL shown above."
+          sleep 20000
