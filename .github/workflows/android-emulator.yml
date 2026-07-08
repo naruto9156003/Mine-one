@@ -39,13 +39,26 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ngrok
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
 
-      - name: Setup & Start Emulator + VNC + Ngrok
-        run: |
-          # Emulator already started by previous action, just wait
-          adb wait-for-device --timeout=120
-          echo "Emulator is ready"
+      - name: Setup Emulator (reactivecircus)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.api_level }}
+          target: google_apis
+          arch: x86_64
+          profile: ${{ inputs.device }}
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          script: echo "Emulator setup done"
 
-          # Virtual Display + VNC
+      - name: Start VNC + noVNC + Ngrok
+        run: |
+          # Add Android SDK to PATH
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+
+          adb wait-for-device --timeout=120
+          echo "✅ Emulator is ready"
+
+          # Start VNC services
           sudo Xvfb :99 -screen 0 1080x1920x24 &
           export DISPLAY=:99
           fluxbox &
@@ -61,15 +74,19 @@ jobs:
           ngrok http 6080 --log=stdout > ngrok.log 2>&1 &
           sleep 10
 
-          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' || echo "Not ready")
+          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' || echo "Not ready yet")
           echo "NGROK_URL=$NGROK_URL" >> $GITHUB_ENV
-          echo "🌐 **Ngrok URL:** $NGROK_URL"
+          echo "🌐 Ngrok URL: $NGROK_URL"
 
       - name: RustDesk & Screenshot
         run: |
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
+
           wget -q https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.deb -O rustdesk.deb
           sudo apt install -y ./rustdesk.deb
           rustdesk --service &
+
           adb exec-out screencap -p > screen.png
           curl -F "file=@screen.png" https://store1.gofile.io/uploadFile | jq -r '.data.downloadPage' > url.txt
           echo "SCREENSHOT_URL=$(cat url.txt)" >> $GITHUB_ENV
