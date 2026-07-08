@@ -3,8 +3,13 @@ name: Android Emulator + RDP + Tailscale + RustDesk
 on:
   workflow_dispatch:
     inputs:
-      ts_authkey:         { description: "Tailscale Auth key", required: true }
-      runtime_minutes:    { description: "Runtime in minutes", required: false, default: "355" }
+      ts_authkey:         
+        description: "Tailscale Auth key (tskey-auth-...)"
+        required: true 
+      runtime_minutes:    
+        description: "Runtime in minutes"
+        required: false
+        default: "355"
 
 permissions:
   contents: read
@@ -54,7 +59,7 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-      # 3. Setup Android SDK & Create Android Emulator (AVD)
+      # 3. Setup Android SDK & Create Android Emulator (AVD) [FIXED]
       - name: Install Android SDK and Create Emulator
         run: |
           New-Item -ItemType Directory -Force -Path $env:ANDROID_HOME | Out-Null
@@ -67,21 +72,29 @@ jobs:
           Move-Item -Path "$env:ANDROID_HOME\cmdline-tools\cmdline-tools" -Destination "$env:ANDROID_HOME\cmdline-tools\latest" -Force
           Remove-Item $zipPath -Force
 
-          # Set Environment Paths
+          # Set Environment Paths for the current runner process
           $env:Path += ";$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator"
           [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Process)
 
-          echo "Installing System Image (Android 9.0 x86)..."
-          # Android 9 (API 28) choose kiya hai kyunki yeh bina acceleration ke bhi sabse stable chalta hai
-          & sdkmanager --sdk_root=$env:ANDROID_HOME "system-images;android-28;default;x86" "platform-tools" "emulator"
-          
-          echo "Accepting Licenses..."
-          auto-accept licenses
-          $yes = , 'y' * 10
-          $yes | & sdkmanager --sdk_root=$env:ANDROID_HOME --licenses
+          # Ek temporary file bana rahe hain jisme 50 baar 'y' (yes) likha hoga licenses accept karne ke liye
+          $yesFile = "$env:TEMP\yes.txt"
+          1..50 | ForEach-Object { "y" } | Out-File -FilePath $yesFile -Encoding ascii -Force
 
+          echo "Accepting Licenses..."
+          cmd /c "sdkmanager --sdk_root=$env:ANDROID_HOME --licenses < `"$yesFile`""
+
+          echo "Installing System Image (Android 9.0 x86), Platform-Tools, and Emulator..."
+          cmd /c "sdkmanager --sdk_root=$env:ANDROID_HOME `"system-images;android-28;default;x86`" `"platform-tools`" `"emulator`" < `"$yesFile`""
+          
           echo "Creating AVD..."
-          echo "no" | & avdmanager create avd -n "AndroidBox" -k "system-images;android-28;default;x86" --force
+          # AVD create karte waqt humein custom hardware profile nahi chahiye, isliye input mein 'no' de rahe hain
+          $noFile = "$env:TEMP\no.txt"
+          "no" | Out-File -FilePath $noFile -Encoding ascii -Force
+          cmd /c "avdmanager create avd -n `"AndroidBox`" -k `"system-images;android-28;default;x86`" --force < `"$noFile`""
+
+          # Safai: Temporary files ko delete kar rahe hain
+          Remove-Item $yesFile, $noFile -Force
+          echo "✅ Android Emulator Setup Completed Successfully!"
 
       # 4. Launch Android Emulator in Background
       - name: Start Android Emulator
@@ -89,13 +102,13 @@ jobs:
           $env:Path += ";$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator"
           [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Process)
 
-          echo "Starting Emulator..."
+          echo "Starting Emulator in Background..."
           # Windows par bina KVM ke software-rendering force karne ke liye '-gpu swiftshader_indirect' crucial hai
           Start-Process -FilePath "$env:ANDROID_HOME\emulator\emulator.exe" -ArgumentList "-avd AndroidBox -no-audio -no-boot-anim -gpu swiftshader_indirect" -WindowStyle Minimized
           
-          echo "Waiting for ADB Device..."
+          echo "Waiting for ADB Device (This takes a few minutes)..."
           & adb wait-for-device
-          echo "✅ Android Device Connected to ADB. Booting in background..."
+          echo "✅ Android Device Connected to ADB. Booting inside RDP..."
 
       # 5. Install RustDesk
       - name: Install RustDesk
@@ -116,6 +129,6 @@ jobs:
           $mins = [int]"${{ inputs.runtime_minutes }}"
           $end = (Get-Date).AddMinutes($mins)
           while ((Get-Date) -lt $end) {
-            Write-Host "✅ System Alive | IP: $env:TAILSCALE_IP | Time Left: $((($end - (Get-Date)).TotalMinutes).ToString('F0')) mins"
+            Write-Host "✅ System Alive | RDP User: Bullettemporary | IP: $env:TAILSCALE_IP | Time Left: $((($end - (Get-Date)).TotalMinutes).ToString('F0')) mins"
             Start-Sleep -Seconds 60
           }
