@@ -1,12 +1,11 @@
-name: Android Emulator + Ngrok + RustDesk + noVNC (A)
+name: Android Emulator + Ngrok + noVNC (A)
 
 on:
   workflow_dispatch:
     inputs:
       quick_test:      { description: "5 min test", type: boolean, default: false }
-      runtime_minutes: { description: "Runtime minutes", required: false, default: "355" }
+      runtime_minutes: { description: "Runtime minutes", required: false, default: "300" }
       api_level:       { description: "Android API Level", required: false, default: "34" }
-      device:          { description: "Device profile", required: false, default: "pixel_7" }
 
 permissions:
   contents: read
@@ -21,16 +20,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 370
     steps:
-      - name: Enable KVM
+      - name: Enable KVM + Install Tools
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl jq unzip xvfb fluxbox x11vnc novnc websockify
+          sudo apt-get update && sudo apt-get install -y curl jq unzip xvfb fluxbox x11vnc novnc websockify net-tools
 
       - name: Setup Ngrok
         run: |
@@ -39,65 +34,57 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ngrok
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
 
-      - name: Setup Emulator (reactivecircus)
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ inputs.api_level }}
-          target: google_apis
-          arch: x86_64
-          profile: ${{ inputs.device }}
-          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
-          script: echo "Emulator setup done"
+      - name: Setup Android SDK & Start Emulator in Background
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+
+          # Start emulator with window support for VNC
+          emulator -avd test -no-audio -no-boot-anim -gpu swiftshader_indirect -skin 1080x1920 &
+          EMU_PID=$!
+
+          echo "EMULATOR_PID=$EMU_PID" >> $GITHUB_ENV
+          echo "✅ Emulator started in background (PID: $EMU_PID)"
+
+          adb wait-for-device --timeout=180
+          echo "✅ Emulator booted successfully"
 
       - name: Start VNC + noVNC + Ngrok
         run: |
-          # Add Android SDK to PATH
-          export ANDROID_HOME=$HOME/android-sdk
-          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
-
-          adb wait-for-device --timeout=120
-          echo "✅ Emulator is ready"
-
-          # Start VNC services
-          sudo Xvfb :99 -screen 0 1080x1920x24 &
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
           export DISPLAY=:99
+
+          sudo Xvfb :99 -screen 0 1080x1920x24 &
+          sleep 3
           fluxbox &
           sleep 3
 
           x11vnc -display :99 -forever -shared -rfbport 5900 -bg &
-          sleep 5
+          sleep 6
 
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
           sleep 8
 
-          # Ngrok
           ngrok http 6080 --log=stdout > ngrok.log 2>&1 &
           sleep 10
 
-          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' || echo "Not ready yet")
+          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' || echo "Not ready")
           echo "NGROK_URL=$NGROK_URL" >> $GITHUB_ENV
-          echo "🌐 Ngrok URL: $NGROK_URL"
+          echo "🌐 **Access Here:** $NGROK_URL"
 
-      - name: RustDesk & Screenshot
+      - name: RustDesk
         run: |
-          export ANDROID_HOME=$HOME/android-sdk
-          export PATH=$ANDROID_HOME/platform-tools:$PATH
-
           wget -q https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.deb -O rustdesk.deb
           sudo apt install -y ./rustdesk.deb
           rustdesk --service &
-
-          adb exec-out screencap -p > screen.png
-          curl -F "file=@screen.png" https://store1.gofile.io/uploadFile | jq -r '.data.downloadPage' > url.txt
-          echo "SCREENSHOT_URL=$(cat url.txt)" >> $GITHUB_ENV
 
       - name: Keep Alive
         run: |
           RUNTIME=${{ inputs.runtime_minutes }}
           [[ "${{ inputs.quick_test }}" == "true" ]] && RUNTIME=5
-          [ $RUNTIME -gt 360 ] && RUNTIME=355
           end=$((SECONDS + RUNTIME*60))
           while [ $SECONDS -lt $end ]; do
-            echo "✅ Android Running | Ngrok: $NGROK_URL"
+            echo "✅ Running | Ngrok: $NGROK_URL"
             sleep 60
           done
