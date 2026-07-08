@@ -1,72 +1,121 @@
-name: Android Emulator + Tailscale (Simple & Reliable)
+name: Android Emulator + RDP + Tailscale + RustDesk
 
 on:
   workflow_dispatch:
     inputs:
-      runtime_minutes:
-        description: "Runtime in minutes"
-        required: false
-        default: "180"
+      ts_authkey:         { description: "Tailscale Auth key", required: true }
+      runtime_minutes:    { description: "Runtime in minutes", required: false, default: "355" }
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
-  android:
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
+  android-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+      ANDROID_HOME: "C:\\AndroidSDK"
+
     steps:
-      - name: Install Dependencies + Tailscale + Socat
+      # 1. Install + Setup Tailscale
+      - name: Install + Up Tailscale
         run: |
-          sudo apt-get update
-          # socat add kiya hai port-forwarding ke liye
-          sudo apt-get install -y curl adb scrcpy socat
-          curl -fsSL https://tailscale.com/install.sh | sh
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+            Remove-Item $dst -Force
+          }
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "android-rdp-box" --accept-dns=true --accept-routes=true
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IPv4: $ip4"
 
-          sudo tailscale up --authkey ${{ secrets.TS_AUTHKEY }} --hostname "android-emu" --accept-routes=true --accept-dns=true
-          echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
-          echo "✅ Tailscale connected"
-
-      - name: Create AVD and Start Emulator
+      # 2. Windows RDP Firewall & User Config
+      - name: Enable RDP user + firewall
         run: |
-          export ANDROID_HOME=$ANDROID_SDK_ROOT
-          export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          echo "Downloading System Image..."
-          # Android 29 (Android 10) x86_64 image download kar rahe hain
-          yes | sdkmanager "system-images;android-29;default;x86_64" > /dev/null
+      # 3. Setup Android SDK & Create Android Emulator (AVD)
+      - name: Install Android SDK and Create Emulator
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:ANDROID_HOME | Out-Null
           
+          echo "Downloading Command Line Tools..."
+          $cmdToolsUrl = "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip"
+          $zipPath = "$env:TEMP\cmdline-tools.zip"
+          Invoke-WebRequest -Uri $cmdToolsUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath "$env:ANDROID_HOME\cmdline-tools" -Force
+          Move-Item -Path "$env:ANDROID_HOME\cmdline-tools\cmdline-tools" -Destination "$env:ANDROID_HOME\cmdline-tools\latest" -Force
+          Remove-Item $zipPath -Force
+
+          # Set Environment Paths
+          $env:Path += ";$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator"
+          [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Process)
+
+          echo "Installing System Image (Android 9.0 x86)..."
+          # Android 9 (API 28) choose kiya hai kyunki yeh bina acceleration ke bhi sabse stable chalta hai
+          & sdkmanager --sdk_root=$env:ANDROID_HOME "system-images;android-28;default;x86" "platform-tools" "emulator"
+          
+          echo "Accepting Licenses..."
+          auto-accept licenses
+          $yes = , 'y' * 10
+          $yes | & sdkmanager --sdk_root=$env:ANDROID_HOME --licenses
+
           echo "Creating AVD..."
-          echo "no" | avdmanager create avd -n test -k "system-images;android-29;default;x86_64" --force
+          echo "no" | & avdmanager create avd -n "AndroidBox" -k "system-images;android-28;default;x86" --force
 
-          echo "Starting Emulator in Background..."
-          # -no-boot-anim add kiya hai taki boot thoda fast ho
-          emulator -avd test -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect &
-          echo "EMU_PID=$!" >> $GITHUB_ENV
-
-          adb wait-for-device
-          echo "Waiting for Android to boot (this might take 5-15 minutes on Ubuntu)..."
-          
-          # Carriage return (\r) ka trap fix kiya
-          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
-            sleep 15
-          done
-          echo "✅ Android Emulator Booted"
-
-      - name: Expose ADB Port & Keep Alive
+      # 4. Launch Android Emulator in Background
+      - name: Start Android Emulator
         run: |
-          # Dhyan de: Localhost (127.0.0.1) ke 5555 port ko Tailscale IP par expose kar rahe hain
-          socat TCP-LISTEN:5555,fork,bind=$TAILSCALE_IP TCP:127.0.0.1:5555 &
+          $env:Path += ";$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator"
+          [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Process)
 
-          echo "=========================================="
-          echo "🎉 READY TO CONNECT!"
-          echo "Tailscale IP: $TAILSCALE_IP"
-          echo ""
-          echo "Apne PC par yeh commands run karo:"
-          echo "1. adb connect $TAILSCALE_IP:5555"
-          echo "2. scrcpy -s $TAILSCALE_IP:5555"
-          echo "=========================================="
+          echo "Starting Emulator..."
+          # Windows par bina KVM ke software-rendering force karne ke liye '-gpu swiftshader_indirect' crucial hai
+          Start-Process -FilePath "$env:ANDROID_HOME\emulator\emulator.exe" -ArgumentList "-avd AndroidBox -no-audio -no-boot-anim -gpu swiftshader_indirect" -WindowStyle Minimized
+          
+          echo "Waiting for ADB Device..."
+          & adb wait-for-device
+          echo "✅ Android Device Connected to ADB. Booting in background..."
 
-          RUNTIME=${{ inputs.runtime_minutes }}
-          end=$((SECONDS + RUNTIME*60))
-          while [ $SECONDS -lt $end ]; do
-            echo "✅ Emulator Running | Tailscale IP: $TAILSCALE_IP | Time Left: $(((end - SECONDS)/60)) mins"
-            sleep 60
-          done
+      # 5. Install RustDesk
+      - name: Install RustDesk
+        run: |
+          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
+          if (-not (Test-Path $rdExe)) {
+            $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.msi"
+            $installerPath = "$env:TEMP\rustdesk.msi"
+            Invoke-WebRequest -Uri $rdUrl -OutFile $installerPath
+            Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
+            Remove-Item $installerPath -Force
+          }
+          Start-Process -FilePath $rdExe
+
+      # 6. Keep Alive Loop
+      - name: Keep Alive Loop
+        run: |
+          $mins = [int]"${{ inputs.runtime_minutes }}"
+          $end = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            Write-Host "✅ System Alive | IP: $env:TAILSCALE_IP | Time Left: $((($end - (Get-Date)).TotalMinutes).ToString('F0')) mins"
+            Start-Sleep -Seconds 60
+          }
